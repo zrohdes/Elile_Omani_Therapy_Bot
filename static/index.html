@@ -1,0 +1,176 @@
+<!-- static/index.html -->
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Hume AI Voice Chat</title>
+    <style>
+        body { font-family: sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; margin: 0; background-color: #f0f0f0; }
+        #controls button { font-size: 1.2em; padding: 10px 20px; cursor: pointer; }
+        #log { width: 80%; max-width: 800px; height: 400px; border: 1px solid #ccc; overflow-y: scroll; padding: 10px; background-color: #fff; margin-top: 20px; }
+        .user-message { color: blue; }
+        .assistant-message { color: green; }
+        .emotions { font-style: italic; color: #555; font-size: 0.9em; }
+    </style>
+</head>
+<body>
+    <h1>Hume AI Empathic Voice</h1>
+    <div id="controls">
+        <button id="connectButton">Start Conversation</button>
+    </div>
+    <div id="log"></div>
+
+    <script>
+        const connectButton = document.getElementById('connectButton');
+        const logDiv = document.getElementById('log');
+
+        let socket;
+        let mediaRecorder;
+        let audioContext;
+        let audioQueue = [];
+        let isPlaying = false;
+
+        connectButton.onclick = () => {
+            if (socket && socket.readyState === WebSocket.OPEN) {
+                // If connected, disconnect
+                mediaRecorder.stop();
+                socket.close();
+            } else {
+                // If not connected, connect
+                startConversation();
+            }
+        };
+
+        function logMessage(type, role, content, emotions = null) {
+            const messageElement = document.createElement('p');
+            messageElement.className = type === 'user_message' ? 'user-message' : 'assistant-message';
+            messageElement.innerHTML = `<strong>${role}:</strong> ${content}`;
+            logDiv.appendChild(messageElement);
+
+            if (emotions) {
+                const emotionsElement = document.createElement('p');
+                emotionsElement.className = 'emotions';
+                const topEmotions = Object.entries(emotions)
+                    .sort(([, a], [, b]) => b - a)
+                    .slice(0, 3)
+                    .map(([name, score]) => `${name} (${score.toFixed(2)})`)
+                    .join(' | ');
+                emotionsElement.textContent = topEmotions;
+                logDiv.appendChild(emotionsElement);
+            }
+            logDiv.scrollTop = logDiv.scrollHeight;
+        }
+
+        async function startConversation() {
+            logDiv.innerHTML = 'Connecting...';
+            connectButton.textContent = 'Connecting...';
+            connectButton.disabled = true;
+
+            // Determine WebSocket protocol based on window location
+            const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsUrl = `${wsProtocol}//${window.location.host}/ws`;
+            socket = new WebSocket(wsUrl);
+
+            socket.onopen = async () => {
+                console.log('WebSocket connected.');
+                logDiv.innerHTML = 'Connected! Please grant microphone access.';
+
+                try {
+                    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                    mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm;codecs=opus' });
+
+                    mediaRecorder.ondataavailable = (event) => {
+                        if (event.data.size > 0 && socket.readyState === WebSocket.OPEN) {
+                            socket.send(event.data);
+                        }
+                    };
+
+                    mediaRecorder.onstart = () => {
+                        console.log('MediaRecorder started.');
+                        connectButton.textContent = 'Stop Conversation';
+                        connectButton.disabled = false;
+                        logDiv.innerHTML = 'Microphone is active. Start speaking!';
+                    };
+
+                    mediaRecorder.onstop = () => {
+                        console.log('MediaRecorder stopped.');
+                        if (socket.readyState === WebSocket.OPEN) {
+                           socket.close();
+                        }
+                    };
+
+                    mediaRecorder.start(500); // Send data every 500ms
+                } catch (error) {
+                    console.error('Error accessing microphone:', error);
+                    logMessage('error', 'System', 'Could not access microphone. Please check permissions.');
+                    socket.close();
+                }
+            };
+
+            socket.onmessage = (event) => {
+                const message = JSON.parse(event.data);
+                console.log('Received message:', message);
+
+                if (message.type === 'user_message' || message.type === 'assistant_message') {
+                    logMessage(message.type, message.message.role, message.message.content, message.models?.prosody?.scores);
+                } else if (message.type === 'audio_output') {
+                    // Decode base64 audio and queue it for playback
+                    const audioData = atob(message.data);
+                    const audioBytes = new Uint8Array(audioData.length);
+                    for (let i = 0; i < audioData.length; i++) {
+                        audioBytes[i] = audioData.charCodeAt(i);
+                    }
+                    audioQueue.push(audioBytes.buffer);
+                    playAudioQueue();
+                } else if (message.type === 'error') {
+                    console.error('Hume Error:', message.message);
+                    logMessage('error', 'System', `Error: ${message.message}`);
+                }
+            };
+
+            socket.onclose = () => {
+                console.log('WebSocket disconnected.');
+                logDiv.innerHTML += '<p>Connection closed.</p>';
+                connectButton.textContent = 'Start Conversation';
+                connectButton.disabled = false;
+                if (mediaRecorder && mediaRecorder.state === 'recording') {
+                    mediaRecorder.stop();
+                }
+            };
+
+            socket.onerror = (error) => {
+                console.error('WebSocket error:', error);
+                logMessage('error', 'System', 'A connection error occurred.');
+                connectButton.textContent = 'Start Conversation';
+                connectButton.disabled = false;
+            };
+        }
+
+        async function playAudioQueue() {
+            if (isPlaying || audioQueue.length === 0) {
+                return;
+            }
+            isPlaying = true;
+
+            if (!audioContext) {
+                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            }
+
+            const audioBuffer = audioQueue.shift();
+            const decodedAudio = await audioContext.decodeAudioData(audioBuffer);
+
+            const source = audioContext.createBufferSource();
+            source.buffer = decodedAudio;
+            source.connect(audioContext.destination);
+            source.start(0);
+
+            source.onended = () => {
+                isPlaying = false;
+                playAudioQueue(); // Play next chunk
+            };
+        }
+    </script>
+</body>
+</html>
