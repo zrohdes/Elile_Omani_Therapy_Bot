@@ -35,6 +35,7 @@
         let audioQueue = [];
         let isPlaying = false;
         const TARGET_SAMPLE_RATE = 24000;
+        let pingInterval; // <-- Add this for our keep-alive timer
 
         // --- Helper Functions for Audio Processing ---
 
@@ -66,6 +67,16 @@
                 buf[l] = Math.min(1, buffer[l]) * 0x7FFF;
             }
             return buf.buffer;
+        }
+
+        // New helper to convert audio buffer to Base64
+        function bufferToBase64(buffer) {
+            const bytes = new Uint8Array(buffer);
+            let binary = '';
+            for (let i = 0; i < bytes.byteLength; i++) {
+                binary += String.fromCharCode(bytes[i]);
+            }
+            return window.btoa(binary);
         }
 
         // --- UI and Logging ---
@@ -117,6 +128,14 @@
                     connectButton.textContent = 'Stop Conversation';
                     connectButton.disabled = false;
                     logDiv.innerHTML = 'Microphone is active. Start speaking!';
+
+                    // Start sending keep-alive pings
+                    pingInterval = setInterval(() => {
+                        if (socket && socket.readyState === WebSocket.OPEN) {
+                            socket.send(JSON.stringify({ type: 'ping' }));
+                        }
+                    }, 10000); // Every 10 seconds
+
                 } catch (error) {
                     console.error('Error accessing microphone:', error);
                     logMessage('error', 'System', 'Could not access microphone. Please check permissions.');
@@ -126,7 +145,6 @@
 
             socket.onmessage = (event) => {
                 const message = JSON.parse(event.data);
-                console.log('Received message:', message);
 
                 if (message.type === 'user_message' || message.type === 'assistant_message') {
                     logMessage(message.type, message.message.role, message.message.content, message.models?.prosody?.scores);
@@ -141,6 +159,8 @@
                 } else if (message.type === 'error') {
                     console.error('Hume Error:', message.message);
                     logMessage('error', 'System', `Error: ${message.message}`);
+                } else if (message.type === 'pong') {
+                    console.log('Received server pong.'); // For debugging
                 }
             };
 
@@ -162,7 +182,6 @@
             mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
             const source = audioContext.createMediaStreamSource(mediaStream);
 
-            // This AudioWorklet processor is the magic. It captures raw audio samples.
             const processorBlob = new Blob([`
                 class AudioProcessor extends AudioWorkletProcessor {
                     process(inputs) {
@@ -184,13 +203,25 @@
                 const pcmFloat32Data = event.data;
                 const resampledData = downsampleBuffer(pcmFloat32Data, audioContext.sampleRate, TARGET_SAMPLE_RATE);
                 const pcm16Data = float32ToInt16(resampledData);
+
+                // UPDATED: Base64 encode and wrap in JSON
+                const base64Data = bufferToBase64(pcm16Data);
                 if (socket && socket.readyState === WebSocket.OPEN) {
-                    socket.send(pcm16Data);
+                    socket.send(JSON.stringify({
+                        type: 'audio_input',
+                        data: base64Data
+                    }));
                 }
             };
         }
 
         function stopConversation() {
+            // Clear the ping interval when the conversation stops
+            if (pingInterval) {
+                clearInterval(pingInterval);
+                pingInterval = null;
+            }
+
             if (mediaStream) {
                 mediaStream.getTracks().forEach(track => track.stop());
                 mediaStream = null;

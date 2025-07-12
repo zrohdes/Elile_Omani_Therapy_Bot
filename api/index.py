@@ -5,13 +5,12 @@ import base64
 import os
 import wave
 import io
+import json # <-- Add this import
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 
-# UPDATED: Correctly import the client from the new location
+# Correctly import the client from the new location
 from hume.client import AsyncHumeClient
-# REMOVED: VoiceConfig is no longer needed for this
-# from hume.models.config import VoiceConfig
 
 # --- Environment and Client Setup ---
 
@@ -28,7 +27,6 @@ if not all([HUME_API_KEY, HUME_SECRET_KEY, HUME_CONFIG_ID]):
 
 # Initialize FastAPI app and Hume client
 app = FastAPI()
-# UPDATED: Use the new client class name
 hume_client = AsyncHumeClient(api_key=HUME_API_KEY)
 
 
@@ -61,7 +59,7 @@ async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
 
     try:
-        # UPDATED: The .chat() method now takes config_id directly
+        # The .chat() method now takes config_id directly
         async with hume_client.empathic_voice.chat(
             config_id=HUME_CONFIG_ID, secret_key=HUME_SECRET_KEY
         ) as socket:
@@ -82,8 +80,17 @@ async def websocket_endpoint(websocket: WebSocket):
 
             # Coroutine to handle receiving messages from the client and sending to Hume
             async def from_client():
-                async for message in websocket.iter_bytes():
-                    await socket.send_bytes(message)
+                # UPDATED to handle JSON messages for ping/pong and audio
+                async for raw_message in websocket.iter_text():
+                    message = json.loads(raw_message)
+                    msg_type = message.get("type")
+
+                    if msg_type == "audio_input":
+                        audio_data = base64.b64decode(message["data"])
+                        await socket.send_bytes(audio_data)
+                    elif msg_type == "ping":
+                        await websocket.send_json({"type": "pong"})
+
 
             # Run both coroutines concurrently
             await asyncio.gather(from_hume(), from_client())
