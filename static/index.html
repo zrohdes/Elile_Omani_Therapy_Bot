@@ -8,11 +8,12 @@
     <title>Hume AI Voice Chat</title>
     <style>
         body { font-family: sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; margin: 0; background-color: #f0f0f0; }
-        #controls button { font-size: 1.2em; padding: 10px 20px; cursor: pointer; }
-        #log { width: 80%; max-width: 800px; height: 400px; border: 1px solid #ccc; overflow-y: scroll; padding: 10px; background-color: #fff; margin-top: 20px; }
+        #controls button { font-size: 1.2em; padding: 10px 20px; cursor: pointer; border-radius: 8px; border: 1px solid #ccc; }
+        #controls button:disabled { cursor: not-allowed; background-color: #e0e0e0; }
+        #log { width: 80%; max-width: 800px; height: 400px; border: 1px solid #ccc; overflow-y: scroll; padding: 10px; background-color: #fff; margin-top: 20px; border-radius: 8px; }
         .user-message { color: blue; }
         .assistant-message { color: green; }
-        .emotions { font-style: italic; color: #555; font-size: 0.9em; }
+        .emotions { font-style: italic; color: #555; font-size: 0.9em; margin-top: -10px; padding-left: 15px; }
     </style>
 </head>
 <body>
@@ -26,22 +27,48 @@
         const connectButton = document.getElementById('connectButton');
         const logDiv = document.getElementById('log');
 
+        // State management
         let socket;
-        let mediaRecorder;
         let audioContext;
+        let processor;
+        let mediaStream;
         let audioQueue = [];
         let isPlaying = false;
+        const TARGET_SAMPLE_RATE = 24000;
 
-        connectButton.onclick = () => {
-            if (socket && socket.readyState === WebSocket.OPEN) {
-                // If connected, disconnect
-                mediaRecorder.stop();
-                socket.close();
-            } else {
-                // If not connected, connect
-                startConversation();
+        // --- Helper Functions for Audio Processing ---
+
+        function downsampleBuffer(buffer, inputSampleRate, outputSampleRate) {
+            if (inputSampleRate === outputSampleRate) return buffer;
+            const sampleRateRatio = inputSampleRate / outputSampleRate;
+            const newLength = Math.round(buffer.length / sampleRateRatio);
+            const result = new Float32Array(newLength);
+            let offsetResult = 0;
+            let offsetBuffer = 0;
+            while (offsetResult < result.length) {
+                const nextOffsetBuffer = Math.round((offsetResult + 1) * sampleRateRatio);
+                let accum = 0, count = 0;
+                for (let i = offsetBuffer; i < nextOffsetBuffer && i < buffer.length; i++) {
+                    accum += buffer[i];
+                    count++;
+                }
+                result[offsetResult] = accum / count;
+                offsetResult++;
+                offsetBuffer = nextOffsetBuffer;
             }
-        };
+            return result;
+        }
+
+        function float32ToInt16(buffer) {
+            let l = buffer.length;
+            const buf = new Int16Array(l);
+            while (l--) {
+                buf[l] = Math.min(1, buffer[l]) * 0x7FFF;
+            }
+            return buf.buffer;
+        }
+
+        // --- UI and Logging ---
 
         function logMessage(type, role, content, emotions = null) {
             const messageElement = document.createElement('p');
@@ -57,18 +84,27 @@
                     .slice(0, 3)
                     .map(([name, score]) => `${name} (${score.toFixed(2)})`)
                     .join(' | ');
-                emotionsElement.textContent = topEmotions;
+                emotionsElement.textContent = `Top Emotions: ${topEmotions}`;
                 logDiv.appendChild(emotionsElement);
             }
             logDiv.scrollTop = logDiv.scrollHeight;
         }
+
+        // --- Main Application Logic ---
+
+        connectButton.onclick = () => {
+            if (connectButton.textContent === 'Start Conversation') {
+                startConversation();
+            } else {
+                stopConversation();
+            }
+        };
 
         async function startConversation() {
             logDiv.innerHTML = 'Connecting...';
             connectButton.textContent = 'Connecting...';
             connectButton.disabled = true;
 
-            // Determine WebSocket protocol based on window location
             const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
             const wsUrl = `${wsProtocol}//${window.location.host}/ws`;
             socket = new WebSocket(wsUrl);
@@ -76,36 +112,15 @@
             socket.onopen = async () => {
                 console.log('WebSocket connected.');
                 logDiv.innerHTML = 'Connected! Please grant microphone access.';
-
                 try {
-                    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-                    mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm;codecs=opus' });
-
-                    mediaRecorder.ondataavailable = (event) => {
-                        if (event.data.size > 0 && socket.readyState === WebSocket.OPEN) {
-                            socket.send(event.data);
-                        }
-                    };
-
-                    mediaRecorder.onstart = () => {
-                        console.log('MediaRecorder started.');
-                        connectButton.textContent = 'Stop Conversation';
-                        connectButton.disabled = false;
-                        logDiv.innerHTML = 'Microphone is active. Start speaking!';
-                    };
-
-                    mediaRecorder.onstop = () => {
-                        console.log('MediaRecorder stopped.');
-                        if (socket.readyState === WebSocket.OPEN) {
-                           socket.close();
-                        }
-                    };
-
-                    mediaRecorder.start(500); // Send data every 500ms
+                    await setupMicrophone();
+                    connectButton.textContent = 'Stop Conversation';
+                    connectButton.disabled = false;
+                    logDiv.innerHTML = 'Microphone is active. Start speaking!';
                 } catch (error) {
                     console.error('Error accessing microphone:', error);
                     logMessage('error', 'System', 'Could not access microphone. Please check permissions.');
-                    socket.close();
+                    if (socket) socket.close();
                 }
             };
 
@@ -116,8 +131,7 @@
                 if (message.type === 'user_message' || message.type === 'assistant_message') {
                     logMessage(message.type, message.message.role, message.message.content, message.models?.prosody?.scores);
                 } else if (message.type === 'audio_output') {
-                    // Decode base64 audio and queue it for playback
-                    const audioData = atob(message.data);
+                    const audioData = atob(message.data); // data is base64 encoded WAV
                     const audioBytes = new Uint8Array(audioData.length);
                     for (let i = 0; i < audioData.length; i++) {
                         audioBytes[i] = audioData.charCodeAt(i);
@@ -132,41 +146,86 @@
 
             socket.onclose = () => {
                 console.log('WebSocket disconnected.');
+                stopConversation(); // Clean up everything
                 logDiv.innerHTML += '<p>Connection closed.</p>';
-                connectButton.textContent = 'Start Conversation';
-                connectButton.disabled = false;
-                if (mediaRecorder && mediaRecorder.state === 'recording') {
-                    mediaRecorder.stop();
-                }
             };
 
             socket.onerror = (error) => {
                 console.error('WebSocket error:', error);
                 logMessage('error', 'System', 'A connection error occurred.');
-                connectButton.textContent = 'Start Conversation';
-                connectButton.disabled = false;
+                stopConversation();
             };
         }
 
-        async function playAudioQueue() {
-            if (isPlaying || audioQueue.length === 0) {
-                return;
+        async function setupMicrophone() {
+            audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            const source = audioContext.createMediaStreamSource(mediaStream);
+
+            // This AudioWorklet processor is the magic. It captures raw audio samples.
+            const processorBlob = new Blob([`
+                class AudioProcessor extends AudioWorkletProcessor {
+                    process(inputs) {
+                        const input = inputs[0];
+                        if (input.length > 0) {
+                            this.port.postMessage(input[0]);
+                        }
+                        return true;
+                    }
+                }
+                registerProcessor('audio-processor', AudioProcessor);
+            `], { type: 'application/javascript' });
+
+            const processorUrl = URL.createObjectURL(processorBlob);
+            await audioContext.audioWorklet.addModule(processorUrl);
+            processor = new AudioWorkletNode(audioContext, 'audio-processor');
+            source.connect(processor);
+            processor.port.onmessage = (event) => {
+                const pcmFloat32Data = event.data;
+                const resampledData = downsampleBuffer(pcmFloat32Data, audioContext.sampleRate, TARGET_SAMPLE_RATE);
+                const pcm16Data = float32ToInt16(resampledData);
+                if (socket && socket.readyState === WebSocket.OPEN) {
+                    socket.send(pcm16Data);
+                }
+            };
+        }
+
+        function stopConversation() {
+            if (mediaStream) {
+                mediaStream.getTracks().forEach(track => track.stop());
+                mediaStream = null;
             }
+            if (processor) {
+                processor.disconnect();
+                processor = null;
+            }
+            if (audioContext) {
+                audioContext.close();
+                audioContext = null;
+            }
+            if (socket && socket.readyState === WebSocket.OPEN) {
+                socket.close();
+            }
+            socket = null;
+            connectButton.textContent = 'Start Conversation';
+            connectButton.disabled = false;
+        }
+
+        async function playAudioQueue() {
+            if (isPlaying || audioQueue.length === 0) return;
             isPlaying = true;
 
-            if (!audioContext) {
-                audioContext = new (window.AudioContext || window.webkitAudioContext)();
-            }
-
             const audioBuffer = audioQueue.shift();
-            const decodedAudio = await audioContext.decodeAudioData(audioBuffer);
+            const tempAudioContext = new (window.AudioContext || window.webkitAudioContext)();
+            const decodedAudio = await tempAudioContext.decodeAudioData(audioBuffer);
 
-            const source = audioContext.createBufferSource();
+            const source = tempAudioContext.createBufferSource();
             source.buffer = decodedAudio;
-            source.connect(audioContext.destination);
+            source.connect(tempAudioContext.destination);
             source.start(0);
 
             source.onended = () => {
+                tempAudioContext.close();
                 isPlaying = false;
                 playAudioQueue(); // Play next chunk
             };

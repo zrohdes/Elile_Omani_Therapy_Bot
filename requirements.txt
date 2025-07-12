@@ -3,5 +3,5 @@
 fastapi
 uvicorn
 python-dotenv
-hume
+hume>=0.8.2  # Specify a version that includes HumeAsyncClient
 websockets
