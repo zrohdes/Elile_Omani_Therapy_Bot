@@ -3,13 +3,15 @@
 import asyncio
 import base64
 import os
-import json
 import wave
 import io
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
-from hume import HumeAsyncClient
-from hume.models.config import VoiceConfig
+
+# UPDATED: Correctly import the client from the new location
+from hume.client import AsyncHumeClient
+# REMOVED: VoiceConfig is no longer needed for this
+# from hume.models.config import VoiceConfig
 
 # --- Environment and Client Setup ---
 
@@ -19,7 +21,6 @@ HUME_SECRET_KEY = os.getenv("HUME_SECRET_KEY")
 HUME_CONFIG_ID = os.getenv("HUME_CONFIG_ID")
 
 if not all([HUME_API_KEY, HUME_SECRET_KEY, HUME_CONFIG_ID]):
-    # This will cause the Vercel deployment to fail if variables are not set, which is good for debugging.
     raise ValueError(
         "Please set HUME_API_KEY, HUME_SECRET_KEY, and HUME_CONFIG_ID "
         "as environment variables in your Vercel project."
@@ -27,7 +28,8 @@ if not all([HUME_API_KEY, HUME_SECRET_KEY, HUME_CONFIG_ID]):
 
 # Initialize FastAPI app and Hume client
 app = FastAPI()
-hume_client = HumeAsyncClient(HUME_API_KEY)
+# UPDATED: Use the new client class name
+hume_client = AsyncHumeClient(api_key=HUME_API_KEY)
 
 
 # --- Helper Function ---
@@ -57,33 +59,30 @@ async def root():
 async def websocket_endpoint(websocket: WebSocket):
     """Handle the WebSocket connection for real-time voice chat."""
     await websocket.accept()
-    config = VoiceConfig.from_id(HUME_CONFIG_ID)
 
     try:
+        # UPDATED: The .chat() method now takes config_id directly
         async with hume_client.empathic_voice.chat(
-            config, secret_key=HUME_SECRET_KEY
+            config_id=HUME_CONFIG_ID, secret_key=HUME_SECRET_KEY
         ) as socket:
             print("Hume socket connected.")
 
             # Coroutine to handle receiving messages from Hume and sending to the client
             async def from_hume():
                 async for message in socket:
+                    # The message format from Hume EVI remains the same
                     if message.type == "audio_output" and message.data:
-                        # Convert raw PCM audio from Hume into a playable WAV file
                         wav_data = create_wav_file_from_pcm(message.data)
-                        # Send the WAV data as a base64 encoded string in a JSON object
                         await websocket.send_json({
                             "type": "audio_output",
                             "data": base64.b64encode(wav_data).decode("utf-8")
                         })
                     elif message.type != "audio_output":
-                        # Send other message types (like user_message, assistant_message) as they are
                         await websocket.send_json(message.model_dump())
 
             # Coroutine to handle receiving messages from the client and sending to Hume
             async def from_client():
                 async for message in websocket.iter_bytes():
-                    # The client now sends raw PCM audio bytes. We forward them to Hume.
                     await socket.send_bytes(message)
 
             # Run both coroutines concurrently
